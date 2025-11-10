@@ -1,10 +1,12 @@
 """Application factory for the MCP Agent Mail server."""
+# ruff: noqa: I001
 
 from __future__ import annotations
 
 import asyncio
 import fnmatch
 import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -19,10 +21,17 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Optional, cast
 from urllib.parse import parse_qsl
+import uuid
 
 from fastmcp import Context, FastMCP
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
+try:
+    from pathspec import PathSpec  # type: ignore[import-not-found]
+    from pathspec.patterns.gitwildmatch import GitWildMatchPattern  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency fallback
+    PathSpec = None  # type: ignore[assignment]
+    GitWildMatchPattern = None  # type: ignore[assignment]
 from sqlalchemy import asc, desc, func, or_, select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import aliased
@@ -32,7 +41,15 @@ from .config import Settings, get_settings
 from .db import ensure_schema, get_session, init_engine
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .llm import complete_system_user
-from .models import Agent, AgentLink, FileReservation, Message, MessageRecipient, Project, ProjectSiblingSuggestion
+from .models import (
+    Agent,
+    AgentLink,
+    FileReservation,
+    Message,
+    MessageRecipient,
+    Project,
+    ProjectSiblingSuggestion,
+)
 from .storage import (
     ProjectArchive,
     archive_write_lock,
@@ -45,6 +62,7 @@ from .storage import (
     write_message_bundle,
 )
 from .utils import generate_agent_name, sanitize_agent_name, slugify, validate_agent_name_format
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +79,7 @@ CLUSTER_CONTACT = "contact"
 CLUSTER_SEARCH = "search"
 CLUSTER_FILE_RESERVATIONS = "file_reservations"
 CLUSTER_MACROS = "workflow_macros"
+CLUSTER_BUILD_SLOTS = "build_slots"
 
 
 class ToolExecutionError(Exception):
@@ -646,9 +665,301 @@ def _message_frontmatter(
         "attachments": attachments,
     }
 
+def _compute_project_slug(human_key: str) -> str:
+    """
+    Compute the project slug with strict backward compatibility by default.
+    When worktree-friendly behavior is enabled, we still default to 'dir' mode
+    until additional identity modes are implemented.
+    """
+    settings = get_settings()
+    # Gate: preserve existing behavior unless explicitly enabled
+    if not settings.worktrees_enabled:
+        return slugify(human_key)
+    # Helpers for identity modes (privacy-safe)
+    def _short_sha1(text: str, n: int = 10) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
+
+    def _norm_remote(url: str | None) -> str | None:
+        if not url:
+            return None
+        url = url.strip()
+        try:
+            if url.startswith("git@"):
+                host = url.split("@", 1)[1].split(":", 1)[0]
+                path = url.split(":", 1)[1]
+            else:
+                from urllib.parse import urlparse as _urlparse
+
+                p = _urlparse(url)
+                host = p.hostname or ""
+                path = (p.path or "")
+        except Exception:
+            return None
+        if not host:
+            return None
+        path = path.lstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        parts = [seg for seg in path.split("/") if seg]
+        if len(parts) < 2:
+            return None
+        owner, repo = parts[0], parts[1]
+        return f"{host}/{owner}/{repo}"
+
+    mode = (settings.project_identity_mode or "dir").strip().lower()
+    # Mode: git-remote
+    if mode == "git-remote":
+        try:
+            # Attempt to use GitPython for robustness across worktrees
+            repo = Repo(human_key, search_parent_directories=True)
+            remote_name = settings.project_identity_remote or "origin"
+            remote_url: str | None = None
+            # Prefer 'git remote get-url' to support multiple urls/rewrite rules
+            try:
+                remote_url = repo.git.remote("get-url", remote_name).strip() or None
+            except Exception:
+                # Fallback: use config if available
+                try:
+                    remote = next((r for r in repo.remotes if r.name == remote_name), None)
+                    if remote and remote.urls:
+                        remote_url = next(iter(remote.urls), None)
+                except Exception:
+                    remote_url = None
+            normalized = _norm_remote(remote_url)
+            if normalized:
+                base = normalized.rsplit("/", 1)[-1] or "repo"
+                canonical = normalized  # privacy-safe canonical string
+                return f"{base}-{_short_sha1(canonical)}"
+        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+            # Non-git directory or error; fall through to fallback
+            pass
+        # Fallback to dir behavior if we cannot resolve a normalized remote
+        return slugify(human_key)
+
+    # Mode: git-toplevel
+    if mode == "git-toplevel":
+        try:
+            repo = Repo(human_key, search_parent_directories=True)
+            top = repo.git.rev_parse("--show-toplevel").strip()
+            if top:
+                from pathlib import Path as _P
+
+                top_real = str(_P(top).resolve())
+                base = _P(top_real).name or "repo"
+                return f"{base}-{_short_sha1(top_real)}"
+        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+            return slugify(human_key)
+        return slugify(human_key)
+
+    # Mode: git-common-dir
+    if mode == "git-common-dir":
+        try:
+            repo = Repo(human_key, search_parent_directories=True)
+            gdir = repo.git.rev_parse("--git-common-dir").strip()
+            if gdir:
+                from pathlib import Path as _P
+
+                gdir_real = str(_P(gdir).resolve())
+                base = "repo"
+                return f"{base}-{_short_sha1(gdir_real)}"
+        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+            return slugify(human_key)
+        return slugify(human_key)
+
+    # Default and 'dir' mode: strict back-compat
+    return slugify(human_key)
+
+
+def _resolve_project_identity(human_key: str) -> dict[str, Any]:
+    """
+    Resolve identity details for a given human_key path.
+    Returns: { slug, identity_mode_used, canonical_path, human_key,
+               repo_root, git_common_dir, branch, worktree_name,
+               core_ignorecase, normalized_remote, project_uid }
+    Writes a private marker under .git/agent-mail/project-id when WORKTREES_ENABLED=1
+    and no marker exists yet.
+    """
+    settings_local = get_settings()
+    mode_config = (settings_local.project_identity_mode or "dir").strip().lower()
+    mode_used = "dir" if not settings_local.worktrees_enabled else mode_config
+    target_path = str(Path(human_key).expanduser().resolve())
+
+    repo_root: Optional[str] = None
+    git_common_dir: Optional[str] = None
+    branch: Optional[str] = None
+    worktree_name: Optional[str] = None
+    core_ignorecase: Optional[bool] = None
+    normalized_remote: Optional[str] = None
+    canonical_path: str = target_path
+
+    def _norm_remote(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        u = url.strip()
+        try:
+            if u.startswith("git@"):
+                host = u.split("@", 1)[1].split(":", 1)[0]
+                path = u.split(":", 1)[1]
+            else:
+                from urllib.parse import urlparse as _urlparse
+                p = _urlparse(u)
+                host = p.hostname or ""
+                path = (p.path or "")
+        except Exception:
+            return None
+        if not host:
+            return None
+        path = path.lstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        parts = [seg for seg in path.split("/") if seg]
+        if len(parts) < 2:
+            return None
+        owner, repo_name = parts[0], parts[1]
+        return f"{host}/{owner}/{repo_name}"
+
+    try:
+        repo = Repo(target_path, search_parent_directories=True)
+        repo_root = str(Path(repo.working_tree_dir or "").resolve())
+        try:
+            git_common_dir = repo.git.rev_parse("--git-common-dir").strip()
+        except Exception:
+            git_common_dir = None
+        try:
+            branch = repo.active_branch.name
+        except Exception:
+            try:
+                branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
+            except Exception:
+                branch = None
+        try:
+            worktree_name = Path(repo.working_tree_dir or "").name or None
+        except Exception:
+            worktree_name = None
+        try:
+            core_ic = repo.config_reader().get_value("core", "ignorecase", "false")
+            core_ignorecase = str(core_ic).strip().lower() == "true"
+        except Exception:
+            core_ignorecase = None
+        remote_name = settings_local.project_identity_remote or "origin"
+        remote_url: Optional[str] = None
+        try:
+            remote_url = repo.git.remote("get-url", remote_name).strip() or None
+        except Exception:
+            try:
+                r = next((r for r in repo.remotes if r.name == remote_name), None)
+                if r and r.urls:
+                    remote_url = next(iter(r.urls), None)
+            except Exception:
+                remote_url = None
+        normalized_remote = _norm_remote(remote_url)
+    except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+        repo = None
+
+    if mode_used == "git-remote" and normalized_remote:
+        canonical_path = normalized_remote
+    elif mode_used == "git-toplevel" and repo_root:
+        canonical_path = repo_root
+    elif mode_used == "git-common-dir" and git_common_dir:
+        canonical_path = str(Path(git_common_dir).resolve())
+    else:
+        canonical_path = target_path
+
+    # Compute project_uid via precedence: committed marker -> private marker -> remote fingerprint -> git-common-dir hash -> dir hash
+    marker_committed: Optional[Path] = Path(repo_root or "") / ".agent-mail-project-id" if repo_root else None
+    marker_private: Optional[Path] = Path(git_common_dir or "") / "agent-mail" / "project-id" if git_common_dir else None
+    project_uid: Optional[str] = None
+    try:
+        if marker_committed and marker_committed.exists():
+            project_uid = (marker_committed.read_text(encoding="utf-8").strip() or None)
+    except Exception:
+        project_uid = None
+    if not project_uid:
+        try:
+            if marker_private and marker_private.exists():
+                project_uid = (marker_private.read_text(encoding="utf-8").strip() or None)
+        except Exception:
+            project_uid = None
+    if not project_uid:
+        # Remote fingerprint
+        remote_uid: Optional[str] = None
+        try:
+            default_branch = None
+            if repo is not None:
+                try:
+                    sym = repo.git.symbolic_ref(f"refs/remotes/{settings_local.project_identity_remote or 'origin'}/HEAD").strip()
+                    if sym.startswith("refs/remotes/"):
+                        default_branch = sym.rsplit("/", 1)[-1]
+                except Exception:
+                    default_branch = "main"
+            if normalized_remote:
+                fingerprint = f"{normalized_remote}@{default_branch or 'main'}"
+                remote_uid = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:20]
+        except Exception:
+            remote_uid = None
+        if remote_uid:
+            project_uid = remote_uid
+    if not project_uid and git_common_dir:
+        try:
+            project_uid = hashlib.sha1(str(Path(git_common_dir).resolve()).encode("utf-8")).hexdigest()[:20]
+        except Exception:
+            project_uid = None
+    if not project_uid:
+        try:
+            project_uid = hashlib.sha1(target_path.encode("utf-8")).hexdigest()[:20]
+        except Exception:
+            project_uid = str(uuid.uuid4())
+
+    # Write private marker if gated and we have a git common dir
+    if settings_local.worktrees_enabled and marker_private and not marker_private.exists():
+        try:
+            marker_private.parent.mkdir(parents=True, exist_ok=True)
+            marker_private.write_text(project_uid + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    slug_value = _compute_project_slug(target_path)
+    payload = {
+        "slug": slug_value,
+        "identity_mode_used": mode_used,
+        "canonical_path": canonical_path,
+        "human_key": target_path,
+        "repo_root": repo_root,
+        "git_common_dir": git_common_dir,
+        "branch": branch,
+        "worktree_name": worktree_name,
+        "core_ignorecase": core_ignorecase,
+        "normalized_remote": normalized_remote,
+        "project_uid": project_uid,
+    }
+    # Rich-styled identity decision logging (optional)
+    try:
+        if get_settings().tools_log_enabled:
+            from rich.console import Console as _Console  # local import to avoid global dependency
+            from rich.table import Table as _Table
+            console = _Console()
+            table = _Table(title="Identity Resolution", show_header=True, header_style="bold white on blue")
+            table.add_column("Field", style="bold cyan")
+            table.add_column("Value")
+            table.add_row("Mode", payload["identity_mode_used"] or "dir")
+            table.add_row("Slug", payload["slug"])
+            table.add_row("Canonical", payload["canonical_path"])
+            table.add_row("Repo Root", payload["repo_root"] or "")
+            table.add_row("Git Common Dir", payload["git_common_dir"] or "")
+            table.add_row("Branch", payload["branch"] or "")
+            table.add_row("Worktree", payload["worktree_name"] or "")
+            table.add_row("Ignorecase", str(payload["core_ignorecase"]))
+            table.add_row("Normalized Remote", payload["normalized_remote"] or "")
+            table.add_row("Project UID", payload["project_uid"] or "")
+            console.print(table)
+    except Exception:
+        # Never fail due to logging
+        pass
+    return payload
+
 async def _ensure_project(human_key: str) -> Project:
     await ensure_schema()
-    slug = slugify(human_key)
+    slug = _compute_project_slug(human_key)
     async with get_session() as session:
         result = await session.execute(select(Project).where(Project.slug == slug))
         project = result.scalars().first()
@@ -659,6 +970,8 @@ async def _ensure_project(human_key: str) -> Project:
         await session.commit()
         await session.refresh(project)
         return project
+
+    # -- Identity inspection resource is registered inside build_mcp_server below
 
 
 async def _get_project_by_identifier(identifier: str) -> Project:
@@ -1451,35 +1764,32 @@ def _file_reservations_conflict(existing: FileReservation, candidate_path: str, 
         return False
     if not existing.exclusive and not candidate_exclusive:
         return False
-    normalized_existing = existing.path_pattern
-    # Treat simple directory patterns like "src/*" as inclusive of files under that directory
-    # when comparing against concrete file paths like "src/app.py".
-    def _expand_dir_star(p: str) -> str:
-        if p.endswith("/*"):
-            return p[:-1] + "*"  # "src/*" -> "src/**"-like breadth for fnmatchcase approximation
-        return p
-    a = _expand_dir_star(candidate_path)
-    b = _expand_dir_star(normalized_existing)
-    return (
-        fnmatch.fnmatchcase(a, b)
-        or fnmatch.fnmatchcase(b, a)
-        or a == b
-    )
+    # Git wildmatch semantics; treat inputs as repo-root relative forward-slash paths
+    def _normalize(p: str) -> str:
+        return p.replace("\\", "/").lstrip("/")
+    if PathSpec and GitWildMatchPattern:
+        spec = PathSpec.from_lines(GitWildMatchPattern, [existing.path_pattern])
+        return spec.match_file(_normalize(candidate_path))
+    # Fallback to conservative fnmatch if pathspec not available
+    pat = existing.path_pattern
+    a = _normalize(candidate_path)
+    b = _normalize(pat)
+    return fnmatch.fnmatchcase(a, b) or fnmatch.fnmatchcase(b, a) or (a == b)
 
 
 def _patterns_overlap(a: str, b: str) -> bool:
-    # Normalize simple relative prefixes for matching
-    def _norm(s: str) -> str:
-        while s.startswith("./"):
-            s = s[2:]
-        return s
-    a1 = _norm(a)
-    b1 = _norm(b)
-    return (
-        fnmatch.fnmatchcase(a1, b1)
-        or fnmatch.fnmatchcase(b1, a1)
-        or a1 == b1
-    )
+    # Overlap if any file could be matched by both patterns (approximate by cross-matching)
+    def _normalize(p: str) -> str:
+        return p.replace("\\", "/").lstrip("/")
+    if PathSpec and GitWildMatchPattern:
+        a_spec = PathSpec.from_lines(GitWildMatchPattern, [a])
+        b_spec = PathSpec.from_lines(GitWildMatchPattern, [b])
+        # Heuristic: check direct cross-matches on normalized patterns
+        return a_spec.match_file(_normalize(b)) or b_spec.match_file(_normalize(a))
+    # Fallback approximate
+    a1 = _normalize(a)
+    b1 = _normalize(b)
+    return fnmatch.fnmatchcase(a1, b1) or fnmatch.fnmatchcase(b1, a1) or (a1 == b1)
 
 
 def _file_reservations_patterns_overlap(paths_a: Sequence[str], paths_b: Sequence[str]) -> bool:
@@ -2128,7 +2438,7 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(name="ensure_project")
     @_instrument_tool("ensure_project", cluster=CLUSTER_SETUP, capabilities={"infrastructure", "storage"}, complexity="low", project_arg="human_key")
-    async def ensure_project(ctx: Context, human_key: str) -> dict[str, Any]:
+    async def ensure_project(ctx: Context, human_key: str, identity_mode: Optional[str] = None) -> dict[str, Any]:
         """
         Idempotently create or ensure a project exists for the given human key.
 
@@ -2200,7 +2510,11 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"Ensuring project for key '{human_key}'.")
         project = await _ensure_project(human_key)
         await ensure_archive(settings, project.slug)
-        return _project_to_dict(project)
+        # Compose identity metadata similar to resource://identity
+        ident = _resolve_project_identity(human_key)
+        payload = _project_to_dict(project)
+        payload.update(ident)
+        return payload
 
     @mcp.tool(name="register_agent")
     @_instrument_tool("register_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name", project_arg="project_key")
@@ -4612,6 +4926,9 @@ def build_mcp_server() -> FastMCP:
         project_key: str,
         code_repo_path: str,
     ) -> dict[str, Any]:
+        if not settings.worktrees_enabled:
+            await ctx.info("Worktree-friendly features are disabled (WORKTREES_ENABLED=0). Skipping guard install.")
+            return {"hook": ""}
         if get_settings().tools_log_enabled:
             try:
                 import importlib as _imp
@@ -4737,6 +5054,10 @@ def build_mcp_server() -> FastMCP:
             extra = f" ({summary})" if summary else ""
             await ctx.info(f"Auto-released {len(stale_auto_releases)} stale file_reservation(s){extra}.")
         project_id = project.id
+        # Lightweight validation: warn on ultra-broad patterns
+        broad = [p for p in paths if p.strip() in {"*", "**/*", "**", "/**/*"}]
+        if broad:
+            await ctx.info(f"[warn] Reservation pattern(s) extremely broad: {', '.join(broad)} — consider narrowing to repo-root relative paths (e.g., 'app/api/*.py').")
         async with get_session() as session:
             existing_rows = await session.execute(
                 select(FileReservation, Agent.name)
@@ -4769,6 +5090,24 @@ def build_mcp_server() -> FastMCP:
                     # Advisory model: still grant the file_reservation but surface conflicts
                     conflicts.append({"path": path, "holders": conflicting_holders})
                 file_reservation = await _create_file_reservation(project, agent, path, exclusive, reason, ttl_seconds)
+                # Attempt to capture branch/worktree context (best-effort; non-blocking)
+                ctx_branch: Optional[str] = None
+                ctx_worktree: Optional[str] = None
+                try:
+                    repo = Repo(project.human_key, search_parent_directories=True)
+                    try:
+                        ctx_branch = repo.active_branch.name
+                    except Exception:
+                        try:
+                            ctx_branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
+                        except Exception:
+                            ctx_branch = None
+                    try:
+                        ctx_worktree = Path(repo.working_tree_dir or "").name or None
+                    except Exception:
+                        ctx_worktree = None
+                except Exception:
+                    pass
                 file_reservation_payload = {
                     "id": file_reservation.id,
                     "project": project.human_key,
@@ -4778,6 +5117,8 @@ def build_mcp_server() -> FastMCP:
                     "reason": file_reservation.reason,
                     "created_ts": _iso(file_reservation.created_ts),
                     "expires_ts": _iso(file_reservation.expires_ts),
+                    "branch": ctx_branch,
+                    "worktree": ctx_worktree,
                 }
                 await write_file_reservation_record(archive, file_reservation_payload)
                 granted.append(
@@ -5170,6 +5511,161 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"Renewed {len(updated)} file_reservation(s) for '{agent.name}'.")
         return {"renewed": len(updated), "file_reservations": updated}
 
+    # --- Build slots (coarse concurrency control) --------------------------------------------
+
+    def _safe_component(value: str) -> str:
+        # Keep it simple and dependency-free: replace common problematic filesystem chars
+        safe = value.strip()
+        for ch in ("/", "\\", ":", "*", "?", "\"", "<", ">", "|", " "):
+            safe = safe.replace(ch, "_")
+        return safe or "unknown"
+
+    def _slot_dir(archive: ProjectArchive, slot: str) -> Path:
+        safe = _safe_component(slot)
+        return archive.root / "build_slots" / safe
+
+    def _compute_branch(path: str) -> Optional[str]:
+        try:
+            repo = Repo(path, search_parent_directories=True)
+            try:
+                return repo.active_branch.name
+            except Exception:
+                return repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
+        except Exception:
+            return None
+
+    def _read_active_slots(slot_path: Path, now: datetime) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        if not slot_path.exists():
+            return results
+        for f in slot_path.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                exp = data.get("expires_ts")
+                if exp:
+                    try:
+                        if datetime.fromisoformat(exp) <= now:
+                            continue
+                    except Exception:
+                        pass
+                results.append(data)
+            except Exception:
+                continue
+        return results
+
+    @mcp.tool(name="acquire_build_slot")
+    @_instrument_tool("acquire_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
+    async def acquire_build_slot(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        slot: str,
+        ttl_seconds: int = 3600,
+        exclusive: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Acquire a build slot (advisory), optionally exclusive. Returns conflicts when another holder is active.
+        """
+        if not settings.worktrees_enabled:
+            await ctx.info("Build slots are disabled (WORKTREES_ENABLED=0).")
+            return {"granted": None, "conflicts": [], "disabled": True}
+        project = await _get_project_by_identifier(project_key)
+        archive = await ensure_archive(settings, project.slug)
+        now = datetime.now(timezone.utc)
+        slot_path = _slot_dir(archive, slot)
+        await asyncio.to_thread(slot_path.mkdir, parents=True, exist_ok=True)
+        active = _read_active_slots(slot_path, now)
+
+        branch = _compute_branch(project.human_key)
+        holder_id = _safe_component(f"{agent_name}__{branch or 'unknown'}")
+        lease_path = slot_path / f"{holder_id}.json"
+
+        conflicts: list[dict[str, Any]] = []
+        if exclusive:
+            for entry in active:
+                if entry.get("agent") == agent_name and entry.get("branch") == branch:
+                    continue
+                if entry.get("exclusive", True):
+                    conflicts.append(entry)
+        payload = {
+            "slot": slot,
+            "agent": agent_name,
+            "branch": branch,
+            "exclusive": exclusive,
+            "acquired_ts": _iso(now),
+            "expires_ts": _iso(now + timedelta(seconds=max(ttl_seconds, 60))),
+        }
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(lease_path.write_text, json.dumps(payload, indent=2), "utf-8")
+        if conflicts:
+            await ctx.info(f"Build slot conflicts for '{slot}': {len(conflicts)}")
+        return {"granted": payload, "conflicts": conflicts}
+
+    @mcp.tool(name="renew_build_slot")
+    @_instrument_tool("renew_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
+    async def renew_build_slot(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        slot: str,
+        extend_seconds: int = 1800,
+    ) -> dict[str, Any]:
+        """
+        Extend expiry for an existing build slot lease. No-op if missing.
+        """
+        if not settings.worktrees_enabled:
+            await ctx.info("Build slots are disabled (WORKTREES_ENABLED=0).")
+            return {"renewed": False, "expires_ts": None, "disabled": True}
+        project = await _get_project_by_identifier(project_key)
+        archive = await ensure_archive(settings, project.slug)
+        now = datetime.now(timezone.utc)
+        slot_path = _slot_dir(archive, slot)
+        branch = _compute_branch(project.human_key)
+        holder_id = _safe_component(f"{agent_name}__{branch or 'unknown'}")
+        lease_path = slot_path / f"{holder_id}.json"
+        try:
+            current = json.loads(lease_path.read_text(encoding="utf-8"))
+        except Exception:
+            current = {}
+        new_exp = _iso(now + timedelta(seconds=max(extend_seconds, 60)))
+        current.update({"slot": slot, "agent": agent_name, "branch": branch, "expires_ts": new_exp})
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(lease_path.write_text, json.dumps(current, indent=2), "utf-8")
+        return {"renewed": True, "expires_ts": new_exp}
+
+    @mcp.tool(name="release_build_slot")
+    @_instrument_tool("release_build_slot", cluster=CLUSTER_BUILD_SLOTS, capabilities={"build"}, project_arg="project_key", agent_arg="agent_name")
+    async def release_build_slot(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        slot: str,
+    ) -> dict[str, Any]:
+        """
+        Mark an active slot lease as released (non-destructive; keeps JSON with released_ts).
+        """
+        if not settings.worktrees_enabled:
+            await ctx.info("Build slots are disabled (WORKTREES_ENABLED=0).")
+            return {"released": False, "released_at": _iso(datetime.now(timezone.utc)), "disabled": True}
+        project = await _get_project_by_identifier(project_key)
+        archive = await ensure_archive(settings, project.slug)
+        now = datetime.now(timezone.utc)
+        slot_path = _slot_dir(archive, slot)
+        branch = _compute_branch(project.human_key)
+        holder_id = _safe_component(f"{agent_name}__{branch or 'unknown'}")
+        lease_path = slot_path / f"{holder_id}.json"
+        released = False
+        try:
+            data = {}
+            if lease_path.exists():
+                data = json.loads(lease_path.read_text(encoding="utf-8"))
+            data.update({"released_ts": _iso(now), "expires_ts": _iso(now)})
+            await asyncio.to_thread(lease_path.write_text, json.dumps(data, indent=2), "utf-8")
+            released = True
+        except Exception:
+            released = False
+        return {"released": released, "released_at": _iso(now)}
+
     @mcp.resource("resource://config/environment", mime_type="application/json")
     def environment_resource() -> dict[str, Any]:
         """
@@ -5209,6 +5705,16 @@ def build_mcp_server() -> FastMCP:
             },
         }
 
+    @mcp.resource("resource://identity/{project}", mime_type="application/json")
+    def identity_resource(project: str) -> dict[str, Any]:
+        """
+        Inspect identity resolution for a given project path. Returns the slug actually used,
+        the identity mode in effect, canonical path for the selected mode, and git repo facts.
+        """
+        raw_path, _ = _split_slug_and_query(project)
+        target_path = str(Path(raw_path).expanduser().resolve())
+
+        return _resolve_project_identity(target_path)
     @mcp.resource("resource://tooling/directory", mime_type="application/json")
     def tooling_directory_resource() -> dict[str, Any]:
         """

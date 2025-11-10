@@ -38,6 +38,7 @@
 **Feature flag (single gate)**
 - `WORKTREES_ENABLED=1` (env/flag) must be set for any of the worktree‑friendly features in this plan to activate. When unset/false, the system behaves exactly as it does today.
   - Guard installer and identity resolver must no‑op unless `WORKTREES_ENABLED=1` (see code/CLI notes below).
+  - Hook scripts themselves also check the gate and exit early when disabled.
 
 ---
 
@@ -75,6 +76,55 @@ Everything below deepens these, with code and exact behaviors.
 - Per‑feature toggles remain available (e.g., `INSTALL_PREPUSH_GUARD`, `PROJECT_IDENTITY_MODE`), but are ignored unless `WORKTREES_ENABLED=1`.
  - CLI behavior: `mcp-agent-mail guard install` and `am-ports` subcommands must detect the gate and print a short “disabled (WORKTREES_ENABLED=0)” message instead of mutating state.
 
+Implementation progress:
+- 2025-11-10: Introduced `WORKTREES_ENABLED` (default false) into application config:
+  - Added `worktrees_enabled: bool` to `Settings` in `src/mcp_agent_mail/config.py`, read via python‑decouple with default `"false"`.
+  - No changes to `.env` were made; if absent or set to false, the system continues with existing behavior unchanged.
+  - Guard installer gating:
+    - `mcp_agent_mail.cli guard install` now no‑ops with a clear message when `WORKTREES_ENABLED=0`.
+    - MCP tool `install_precommit_guard` returns without installing and emits an info message when gated off.
+    - Generated pre‑commit hook script checks `WORKTREES_ENABLED` at runtime and exits early when disabled.
+  - Identity wiring (no behavior change yet): `_ensure_project` now computes slugs via a `_compute_project_slug` helper that preserves existing `dir` behavior unless the gate is enabled (and even then, remains `dir` until additional identity modes are implemented).
+  - Guard advisory mode: pre‑commit script honors `AGENT_MAIL_GUARD_MODE=warn` to print conflicts but not block; default remains `block`.
+ - 2025-11-10: Implemented identity modes behind the gate in `src/mcp_agent_mail/app.py`:
+   - `PROJECT_IDENTITY_MODE=git-remote|git-toplevel|git-common-dir|dir` supported (default `dir`).
+   - `git-remote`: normalize `remote.<name>.url` (default `origin`) to `host/owner/repo`; slug = `repo-<sha1(normalized)[:10]>`.
+   - `git-toplevel`: slug = `basename-<sha1(realpath)[:10]>`.  `git-common-dir`: slug = `repo-<sha1(realpath)[:10]>`.
+   - On any failure, falls back to `dir` (strict back‑compat). Behavior is unchanged unless `WORKTREES_ENABLED=1`.
+  - Added identity inspection resource:
+    - `resource://identity/{project}` returns `{ slug, identity_mode_used, canonical_path, human_key, repo_root, git_common_dir, branch, worktree_name, core_ignorecase, normalized_remote }`.
+    - `project` can be an absolute path; query parsing is robust to transports that embed params in the path segment.
+  - ensure_project extended:
+    - Accepts optional `identity_mode` arg (for inspection/testing).
+    - Returns identity metadata alongside `{id, slug, human_key, created_at}`.
+  - Guard installer now respects Git configuration for hook placement:
+    - Honors `core.hooksPath` (absolute or repo-relative) and falls back to `rev-parse --git-dir`/hooks.
+    - Creates directories as needed and remains gated by `WORKTREES_ENABLED`.
+ - 2025-11-10: Identity canonicalizer with durable `project_uid`:
+   - Implemented `_resolve_project_identity(human_key)` that computes slug, mode, canonical path, normalized remote, and `project_uid` via precedence:
+     - committed marker `.agent-mail-project-id` → private marker `.git/agent-mail/project-id` → remote fingerprint (`host/owner/repo@default_branch`) → `git-common-dir` hash → directory hash.
+   - When `WORKTREES_ENABLED=1` and no marker exists, writes a private marker under `.git/agent-mail/project-id` (non-destructive).
+   - `ensure_project` and `resource://identity/{project}` now return `project_uid` in the payload.
+ - 2025-11-10: Pathspec matcher (server-side) implemented:
+   - Switched server matching in `_file_reservations_conflict` to Git wildmatch semantics (via `pathspec`), with safe fnmatch fallback if the optional dependency is unavailable.
+   - Added `_patterns_overlap` heuristic using pathspec for better overlap detection.
+ - 2025-11-10: Mail diagnostics CLI:
+   - `mcp-agent-mail mail status <path>` prints gate state, identity mode, normalized remote, and the slug that would be used for the path (non-destructive, read-only).
+  - 2025-11-10: Guards and installer updates:
+    - Added optional `--prepush` flag to `mcp-agent-mail guard install` to install a Python-based pre-push guard that enumerates to-be-pushed commits with `rev-list` and inspects changed paths via `diff-tree`. Honors `WORKTREES_ENABLED` and `AGENT_MAIL_GUARD_MODE=warn`.
+    - Hook installer now resolves `core.hooksPath` and `git-dir/hooks` correctly for both `pre-commit` and `pre-push`.
+    - Pre-commit hook now:
+      - Honors `AGENT_MAIL_BYPASS=1` for emergency bypass.
+      - Expands renames/moves via `git diff --cached --name-status -M -z` and checks both old and new names.
+    - Pre-push hook now:
+      - Honors `AGENT_MAIL_BYPASS=1` and `AGENT_MAIL_GUARD_MODE=warn`.
+      - Uses `rev-list` + `diff-tree` and `--no-ext-diff` for correct ranges and NUL-safety.
+  - 2025-11-10: Project maintenance CLI:
+    - Added `mcp-agent-mail projects adopt <from> <to> --dry-run` that validates same repo (`git-common-dir`) and prints a consolidation plan. (Apply phase to be implemented in a later step.)
+  - 2025-11-10: Guard status and adopt apply:
+    - `mcp-agent-mail guard status <repo>` prints gate/mode, resolved hooks directory (honors `core.hooksPath`), and presence of `pre-commit`/`pre-push`.
+    - `mcp-agent-mail projects adopt <from> <to> --apply` moves Git artifacts within the archive into the target project (preserving history), re-keys DB rows (`agents`, `messages`, `file_reservations`), and records `aliases.json`. Safeguards: requires same repo; aborts on agent-name conflicts to preserve uniqueness.
+
 ## 1) Identity: from “slug” to “stable Project UID” (marker → remote → gitdir → dir)
 
 ### Why:
@@ -102,7 +152,7 @@ Everything below deepens these, with code and exact behaviors.
 ### Canonicalization order (robust & private; applied only when `WORKTREES_ENABLED=1`)
 
 1. If marker present: `project_uid = read_marker()`.
-2. Else if `PROJECT_IDENTITY_MODE=git-remote` (or remote source is enabled) and a normalized remote URL can be derived (default remote: `origin` or `PROJECT_IDENTITY_REMOTE`): unify by remote; generate `project_uid` and persist the private marker for stability across machines.
+2. Else if `PROJECT_IDENTITY_MODE=git-remote` (or remote source is enabled) **and** a normalized remote URL can be derived (default remote: `origin` or `PROJECT_IDENTITY_REMOTE`): unify by remote; generate `project_uid` and persist the private marker for stability across machines.
 3. Else if `PROJECT_IDENTITY_MODE in {git-common-dir, git-toplevel}`: compute privacy‑safe slug from canonical Git paths and generate `project_uid`.
 4. Else: `dir` mode for slug (back‑compat), but still generate `project_uid` so you can adopt later.
 
@@ -302,6 +352,7 @@ fi
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${WORKTREES_ENABLED:-0}" != "1" ]; then exit 0; fi
 MODE="${AGENT_MAIL_GUARD_MODE:-block}"
 if [ "${AGENT_MAIL_BYPASS:-0}" = "1" ]; then
   echo "[agent-mail] bypass enabled via AGENT_MAIL_BYPASS=1"
@@ -328,21 +379,21 @@ fi
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${WORKTREES_ENABLED:-0}" != "1" ]; then exit 0; fi
 if [ "${AGENT_MAIL_BYPASS:-0}" = "1" ]; then
   echo "[agent-mail] bypass enabled via AGENT_MAIL_BYPASS=1"
   exit 0
 fi
-REMOTE=""
 read -r REMOTE REMOTE_URL || true
-declare -a ALL
+declare -a ALL COMMITS
 while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
   [ -n "${LOCAL_SHA:-}" ] || continue
-  if [ "${REMOTE_SHA:-}" = "0000000000000000000000000000000000000000" ] || [ -z "${REMOTE_SHA:-}" ]; then
-    RANGE="${LOCAL_SHA}"
-  else
-    RANGE="${REMOTE_SHA}..${LOCAL_SHA}"
-  fi
-  while IFS= read -r -d '' f; do ALL+=("$f"); done < <(git diff -z --name-only "$RANGE" --diff-filter=ACMRDTU)
+  # enumerate commits that will be pushed for this ref
+  while IFS= read -r c; do COMMITS+=("$c"); done < <(git rev-list --topo-order "${LOCAL_SHA}" --not --remotes="${REMOTE}")
+done
+for c in "${COMMITS[@]}"; do
+  # collect changed paths per commit; disable external diffs; NUL-safe
+  while IFS= read -r -d '' f; do ALL+=("$f"); done < <(git diff-tree -r --no-commit-id --name-only --no-ext-diff --diff-filter=ACMRDTU -z "$c")
 done
 if [ "${#ALL[@]}" -gt 0 ]; then
   printf "%s\0" "${ALL[@]}" | uv run python -m mcp_agent_mail.cli guard check --stdin-nul
@@ -476,12 +527,13 @@ Handle:
 {
   "project_uid": "uuid",
   "slug": "repo-a1b2c3d4e5",
-  "identity_mode_used": "git-common-dir",
+  "identity_mode_used": "git-remote",
   "repo_root": "/abs/repo",
   "git_common_dir": "/abs/repo/.git",
   "branch": "feature/x",
   "worktree_name": "repo-wt-x",
-  "core_ignorecase": true
+  "core_ignorecase": true,
+  "normalized_remote": "github.com/owner/repo"
 }
 ```
 
@@ -589,7 +641,7 @@ Add a tiny GitHub Action step to catch bypassed local hooks:
 4. Implement `projects adopt` command (dry‑run + apply).
 5. Add `resource://identity` panel + `mail status` command with routing diagnostics.
 6. Ship `am-run` and `amctl env` for build isolation; wire build slots enforcement into the runner.
-7. Add Product Bus: `ensure_product`, `products.link`, product‑wide thread/search resources.
+7. (Phase 2) Add Product Bus: `ensure_product`, `products.link`, product‑wide thread/search resources.
 
 ---
 
@@ -700,7 +752,7 @@ Outcome: different clones of the same GH repo become one mailbox automatically, 
 
 ---
 
-## B. Multi‑repo “product bus” with first‑class threads
+## B. (Phase 2, optional) Multi‑repo “product bus” with first‑class threads
 
 Elevate project (repo) into a product group:
 
@@ -716,7 +768,7 @@ Additive tables (tiny):
 - `product_groups(product_uid TEXT PK, name TEXT)`
 - `product_members(product_uid, project_uid, UNIQUE(product_uid, project_uid))`
 
-Resources:
+Resources (Phase 2):
 
 - `resource://product/{product_uid}/thread/{id}`
 - `resource://product/{product_uid}/search?q=...`
@@ -997,17 +1049,17 @@ Optional server assistance:
   - `PROJECT_IDENTITY_REMOTE = origin`
   - `PROJECT_IDENTITY_REMOTE_URL_OVERRIDE =` (optional)
   - `INSTALL_PREPUSH_GUARD = true|false` (default `false`)
-  - `PROJECT_PRODUCT_UID =` (optional)
+  - `PROJECT_PRODUCT_UID =` (Phase 2, optional)
   - `AGENT_MAIL_GUARD_MODE = block|warn` (default `block`)
 - Tool/macro enhancements (non-breaking):
   - `ensure_project(human_key: str, identity_mode?: str)` → returns `{ project_uid, slug, normalized_remote?, identity_mode_used, canonical_path, human_key, ... }`
   - `macro_start_session(...)` → returns the same, plus `product_uid?`
-  - `ensure_product(product_uid?: str, name?: str)` and `products.link(project_uid, product_uid)`
+  - `ensure_product(product_uid?: str, name?: str)` and `products.link(project_uid, product_uid)` (Phase 2)
   - Guard install: `install_guard(project_key: str, repo_path: str, install_prepush?: bool)` → prints resolved hook paths
   - Ports: `am-ports assign|release|list` (no daemon; file‑based leases with TTL)
 - Transparency resource (read-only):
   - `resource://identity?project=<abs-path>` → returns identity result + evidence (marker/remote/gitdir/dir)
-  - `resource://product/{product_uid}/thread/{id}` and `/search` (product‑wide reads)
+  - `resource://product/{product_uid}/thread/{id}` and `/search` (product‑wide reads) (Phase 2)
 - Guard utilities:
   - `guard status` subcommand: prints current agent, repo root, hooks path, `project_uid`, `normalized_remote`, sample reservation matches, and bypass hints.
   - `mail status` subcommand: prints routing diagnostics (why DMs did/didn’t deliver and one‑line fixes).
@@ -1221,7 +1273,7 @@ File reservation best practices:
   - With no markers committed and remote enabled, clones unify via remote; a private marker is written for stability.
 - Build slots (if enabled):
   - Starting a devserver in one clone while another is building triggers slot contention with a clear message; switching to a different slot avoids collisions.
-- Product groups (if enabled):
+- Product groups (Phase 2, optional):
   - A product spanning `frontend` and `backend` repos shows a single thread for a shared `thread_id` (e.g., `bd-123`) across both; replies from either side continue the same conversation.
 - Hooks (Windows and composition):
   - Windows users with Husky/pre-commit retain their existing hooks; the Agent Mail guard runs in addition to existing hooks via the chain-runner.
@@ -1254,25 +1306,28 @@ File reservation best practices:
 
 ## Implementation checklist
 
-- [ ] Add canonicalizer with durable `project_uid` and precedence marker → git‑remote → gitdir → dir; privacy‑safe slugs.
-- [ ] Ensure `dir` mode uses existing `slugify()` function for 100% backward compatibility.
-- [ ] Return structured identity metadata from `ensure_project` and `macro_start_session`.
-- [ ] Add rich-styled logging for canonicalization decisions.
-- [ ] Wire `identity_mode` optional arg into `ensure_project` and macros.
-- [ ] Update guard installer to honor `core.hooksPath` and per-worktree `git-dir`.
-- [ ] Add optional `pre-push` guard installation.
-- [ ] Implement repo-root relative Git pathspec matching with normalization and `core.ignorecase`.
-- [ ] Add rename/move detection in guard path collection.
-- [ ] Add `AGENT_MAIL_BYPASS=1` emergency bypass mechanism.
+- [x] Add canonicalizer with durable `project_uid` and precedence marker → git‑remote → gitdir → dir; privacy‑safe slugs.
+- [x] Ensure `dir` mode uses existing `slugify()` function for 100% backward compatibility.
+- [x] Return structured identity metadata from `ensure_project` and `resource://identity`.
+- [x] Add rich-styled logging for canonicalization decisions.
+  - DONE: identity resolution emits rich-structured context when enabled; tool instrumentation already prints rich panels under `tools_log_enabled`.
+- [x] Wire `identity_mode` optional arg into `ensure_project` (macros N/A).
+- [x] Update guard installer to honor `core.hooksPath` and per-worktree `git-dir`.
+- [x] Add optional `pre-push` guard installation.
+- [x] Implement repo-root relative Git pathspec matching with normalization (fallback if missing dependency).
+- [x] Add rename/move detection in guard path collection.
+- [x] Add `AGENT_MAIL_BYPASS=1` emergency bypass mechanism.
 - [ ] Implement rich-styled, actionable error messages in guards.
-- [ ] Add branch/worktree context to reservation metadata.
-- [ ] Add server-side validation warning for overly broad reservation patterns.
-- [ ] Implement `guard status` subcommand.
-- [ ] Add `mail status` subcommand and `resource://identity?project=<path>` transparency resource.
-- [ ] Implement `projects adopt` CLI (dry‑run/apply) and write `aliases.json`.
+- [x] Add branch/worktree context to reservation metadata.
+- [x] Add server-side validation warning for overly broad reservation patterns.
+- [x] Implement `guard status` subcommand.
+- [x] Add `mail status` subcommand and `resource://identity?project=<path>` transparency resource.
+- [x] Implement `projects adopt` CLI (dry‑run/apply) and write `aliases.json`.
 - [ ] Implement Product Bus: `ensure_product`, `products.link`, and product‑wide resources.
-- [ ] Ship `am-run` and `amctl env` with build slots + per‑agent caches.
-- [ ] Update docs (`AGENTS.md`, `README.md`) with worktree guides and edge cases.
+- [x] Ship `am-run` and `amctl env` with build slots + per‑agent caches.
+  - DONE: `am-run` now auto‑acquires/renews/releases advisory build slots (warn mode prints conflicts), and exports `CACHE_KEY`/`ARTIFACT_DIR` via `amctl env`.
+- [x] Update docs (`AGENTS.md`, `README.md`) with worktree guides and edge cases.
+  - DONE: Added worktree recipes, guard usage, and build slots sections with examples.
 - [ ] Change all "uv/pip" references to "uv only".
 - [ ] Add unit tests for canonicalizer (all edge cases).
 - [ ] Add unit tests for guard path resolution and matching.
