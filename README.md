@@ -1473,14 +1473,30 @@ sequenceDiagram
     - `mcp-agent-mail guard install <project_key> <repo_path> --prepush`
   - Pre-commit honors `WORKTREES_ENABLED` and `AGENT_MAIL_GUARD_MODE` (`warn` advisory).
   - Pre-push enumerates to-be-pushed commits (`rev-list`) and uses `diff-tree` with `--no-ext-diff`.
+  - Composition-safe install (chain-runner):
+    - A Python chain-runner is written to `.git/hooks/pre-commit` and `.git/hooks/pre-push`.
+    - It executes `hooks.d/<hook>/*` in lexical order, then `<hook>.orig` if present (existing hooks are preserved, not overwritten).
+    - Agent Mail installs its guard as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
+    - Windows shims (`pre-commit.cmd/.ps1`, `pre-push.cmd/.ps1`) are written to invoke the Python chain-runner.
 
-## Identity and worktree mode (opt-in)
+## Git-based project identity (opt-in)
 
-- Gate: `WORKTREES_ENABLED=1` enables worktree-friendly features. Default off.
+- Gate: `WORKTREES_ENABLED=1` or `GIT_IDENTITY_ENABLED=1` enables git-based identity features. Default off.
 - Identity modes (default `dir`): `dir`, `git-remote`, `git-toplevel`, `git-common-dir`.
 - Inspect identity for a path:
   - Resource (MCP): `resource://identity/{/abs/path}`
   - CLI (diagnostics): `mcp-agent-mail mail status /abs/path`
+
+- Precedence (when gate is on):
+  1) Committed marker `.agent-mail-project-id` (recommended)
+  2) Discovery YAML `.agent-mail.yaml` with `project_uid:`
+  3) Private marker under Git common dir `.git/agent-mail/project-id`
+  4) Remote fingerprint: normalized `origin` URL + default branch
+  5) `git-common-dir` hash; else dir hash
+
+- Migration helpers:
+  - Write committed marker: `mcp-agent-mail projects mark-identity . --commit`
+  - Scaffold discovery file: `mcp-agent-mail projects discovery-init . --product <product_uid>`
 
 ## Build slots and helpers (opt-in)
 
@@ -1491,6 +1507,10 @@ sequenceDiagram
   - Example: `mcp-agent-mail am-run frontend-build -- npm run dev`
 
 - Build slots (advisory, per-project coarse locking):
+  - Flags:
+    - `--ttl-seconds`: lease duration (default 3600)
+    - `--shared/--exclusive`: non-exclusive or exclusive lease (default exclusive)
+    - `--block-on-conflicts`: exit non-zero if exclusive conflicts are detected before starting
   - Acquire:
     - Tool: `acquire_build_slot(project_key, agent_name, slot, ttl_seconds=3600, exclusive=true)`
   - Renew:
@@ -1501,6 +1521,49 @@ sequenceDiagram
     - Slots are recorded under the project archive `build_slots/<slot>/<agent>__<branch>.json`
     - `exclusive=true` reports conflicts if another active exclusive holder exists
     - Intended for long-running tasks (dev servers, watchers); pair with `am-run` and `amctl env`
+
+## Product Bus
+
+Group multiple repositories (e.g., frontend, backend, infra) under a single product for product‑wide inbox/search and shared threads.
+
+- Ensure a product:
+  - `mcp-agent-mail products ensure MyProduct --name "My Product"`
+- Link a project (slug or path) into the product:
+  - `mcp-agent-mail products link MyProduct .`
+- Inspect product and linked projects:
+  - `mcp-agent-mail products status MyProduct`
+- Product‑wide message search (FTS):
+  - `mcp-agent-mail products search MyProduct "urgent AND deploy" --limit 50`
+- Product‑wide inbox:
+  - `mcp-agent-mail products inbox MyProduct Alice --limit 50 --urgent-only --include-bodies --since-ts "2025-11-01T00:00:00Z"`
+- Product‑wide thread summarization:
+  - `mcp-agent-mail products summarize-thread MyProduct "bd-123" --per-thread-limit 100 --no-llm`
+
+## Containers
+
+- Build and run locally:
+  ```bash
+  docker build -t mcp-agent-mail .
+  docker run --rm -p 8765:8765 \
+    -e HTTP_HOST=0.0.0.0 \
+    -e STORAGE_ROOT=/data/mailbox \
+    -v agent_mail_data:/data \
+    mcp-agent-mail
+  ```
+- Or with Compose:
+  ```bash
+  docker compose up --build
+  ```
+- Notes:
+  - Runs as an unprivileged user (`appuser`, uid 10001).
+  - Includes a HEALTHCHECK against `/health/liveness`.
+  - The server reads config from `.env` via python-decouple. You can mount it read-only into the container at `/app/.env`.
+  - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
+  - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).
+
+Notes
+- A unique `product_uid` is stored for each product; you can reference a product by uid or name.
+- Server tools also exist for orchestration: `ensure_product`, `products_link`, `search_messages_product`, and `resource://product/{key}`.
 
 
 Exclusive file reservations are advisory but visible and auditable:
